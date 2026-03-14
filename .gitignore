@@ -1,0 +1,33 @@
+# Personal config (contains credentials, phone, email, etc.)
+config.py
+
+# Browser profile (contains login cookies/sessions)
+.chrome_profile/
+
+# Virtual environment
+.venv/
+
+# Application history (personal data)
+applied_jobs.json
+pipeline.csv
+unknown_fields.json
+
+# Resume (personal document)
+resume.pdf
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Debug/test scripts
+test_*.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
