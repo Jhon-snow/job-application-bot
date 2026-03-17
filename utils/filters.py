@@ -102,15 +102,29 @@ def is_location_match(
         location_lower
         .replace("hybrid", "")
         .replace("work from office", "")
+        .replace("in office", "")
+        .replace("onsite or remote", "")
+        .replace("onsite", "")
         .replace("work from home", "")
         .replace("on-site", "")
         .replace("on site", "")
+        .replace("\u2013", "")  # em-dash used by Wellfound
+        .replace("–", "")
+        .replace("—", "")
         .strip(" -,()")
     )
 
     is_hybrid = "hybrid" in location_lower
-    is_wfo = "work from office" in location_lower
-    is_remote = "remote" in location_lower or "work from home" in location_lower
+    is_wfo = (
+        "work from office" in location_lower
+        or "in office" in location_lower
+        or ("onsite" in location_lower and "remote" not in location_lower)
+    )
+    is_remote = (
+        "remote" in location_lower
+        or "work from home" in location_lower
+        or "wfh" in location_lower
+    )
 
     if is_remote:
         return True

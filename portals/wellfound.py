@@ -45,18 +45,29 @@ def login(driver: webdriver.Chrome, email: str = "", password: str = "") -> bool
 def search_jobs(
     driver: webdriver.Chrome, keyword: str = "", location: str = "",
 ) -> list[dict]:
-    """Browse Wellfound job listings for backend roles."""
+    """Browse Wellfound job listings with fallback URL strategies."""
     role = keyword or "backend-engineer"
     slug = role.lower().replace(" ", "-")
-    url = f"{BASE_URL}/role/l/{slug}/india"
-    logger.info(f"Searching Wellfound: {role}")
-    driver.get(url)
-    time.sleep(6)
 
-    _scroll_page(driver, scrolls=5)
+    urls_to_try = [
+        f"{BASE_URL}/role/l/{slug}/india",
+        f"{BASE_URL}/role/{slug}",
+        f"{BASE_URL}/jobs/{slug}",
+    ]
 
-    jobs = _extract_jobs(driver)
-    logger.info(f"Found {len(jobs)} Wellfound jobs")
+    jobs = []
+    for url in urls_to_try:
+        logger.info(f"Searching Wellfound: {url}")
+        driver.get(url)
+        time.sleep(6)
+
+        _scroll_page(driver, scrolls=8)
+        jobs = _extract_jobs(driver)
+        if jobs:
+            break
+        logger.info(f"No jobs at {url}, trying next URL pattern")
+
+    logger.info(f"Found {len(jobs)} Wellfound jobs for '{role}'")
 
     if not jobs:
         _debug_dump_page(driver)
@@ -64,20 +75,22 @@ def search_jobs(
     return jobs
 
 
-def _scroll_page(driver: webdriver.Chrome, scrolls: int = 5):
+def _scroll_page(driver: webdriver.Chrome, scrolls: int = 8):
+    last_height = 0
     for _ in range(scrolls):
         driver.execute_script(
             "window.scrollTo(0, document.body.scrollHeight)"
         )
         time.sleep(2)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
 
 
 JS_EXTRACT_JOBS = """
 var results = [];
 
-// Wellfound uses Apply buttons with consistent class patterns.
-// Each job card has: company link (neutral-1000), title link (brand-burgandy),
-// and Save + Apply buttons.
 var allBtns = Array.from(document.querySelectorAll('button'));
 var applyBtns = allBtns.filter(function(b) {
     var t = (b.textContent || '').trim().toLowerCase();
@@ -97,16 +110,17 @@ applyBtns.forEach(function(btn, idx) {
     var title = '';
     var company = '';
     var location = '';
+    var link = '';
 
-    // Title: link with class containing 'brand-burgandy'
     var titleEl = card.querySelector('a[class*="burgandy"], a[class*="brand-"]');
-    if (titleEl) title = titleEl.textContent.trim().split('\\n')[0].trim();
+    if (titleEl) {
+        title = titleEl.textContent.trim().split('\\n')[0].trim();
+        link = titleEl.getAttribute('href') || '';
+    }
 
-    // Company: link with class containing 'neutral-1000'
     var companyEl = card.querySelector('a[class*="neutral-1000"]');
     if (companyEl) company = companyEl.textContent.trim().split('\\n')[0].trim();
 
-    // Fallback: walk anchors by href pattern
     if (!title || !company) {
         var anchors = card.querySelectorAll('a[href]');
         for (var j = 0; j < anchors.length; j++) {
@@ -114,30 +128,66 @@ applyBtns.forEach(function(btn, idx) {
             var text = anchors[j].textContent.trim().split('\\n')[0].trim();
             if (text.length < 3 || text.length > 150) continue;
             if (!company && href.includes('/company/')) company = text;
-            else if (!title && (href.includes('/jobs/') || href.includes('/role/')))
+            else if (!title && (href.includes('/jobs/') || href.includes('/role/'))) {
                 title = text;
+                link = href;
+            }
         }
     }
 
-    // Location: scan text lines for city names
+    if (link && !link.startsWith('http')) link = 'https://wellfound.com' + link;
+
+    // Location: Wellfound uses formats like "In office \\u2013 Bangalore Urban",
+    // "Onsite or remote \\u2013 Mumbai+1", "Remote \\u2013 India"
     var lines = (card.innerText || '').split('\\n')
         .map(function(s) { return s.trim(); })
         .filter(function(s) { return s.length > 2 && s.length < 200; });
-    var cities = ['bangalore','bengaluru','noida','gurgaon','gurugram',
-                  'hyderabad','mumbai','pune','chennai','delhi',
-                  'remote','india'];
-    for (var k = 0; k < lines.length; k++) {
-        var lower = lines[k].toLowerCase();
-        for (var c = 0; c < cities.length; c++) {
-            if (lower.includes(cities[c])) { location = lines[k]; break; }
+
+    // First pass: look for Wellfound's "In office/Remote/Onsite \\u2013 City" pattern
+    for (var m = 0; m < lines.length; m++) {
+        var line = lines[m];
+        if (line.includes('\\u2013') || line.includes('-')) {
+            var lower2 = line.toLowerCase();
+            if (lower2.includes('office') || lower2.includes('remote')
+                || lower2.includes('onsite') || lower2.includes('hybrid')) {
+                location = line;
+                break;
+            }
         }
-        if (location) break;
+    }
+
+    // Second pass: scan for city keywords
+    if (!location) {
+        var cities = ['bangalore','bengaluru','noida','gurgaon','gurugram',
+                      'hyderabad','mumbai','pune','chennai','delhi',
+                      'remote','india','work from home'];
+        for (var k = 0; k < lines.length; k++) {
+            var lower = lines[k].toLowerCase();
+            for (var c = 0; c < cities.length; c++) {
+                if (lower.includes(cities[c])) { location = lines[k]; break; }
+            }
+            if (location) break;
+        }
+    }
+
+    // Last resort: scan full card text
+    if (!location) {
+        var cardText = (card.innerText || '').toLowerCase();
+        var fallbackCities = ['bangalore','bengaluru','noida','gurgaon','gurugram',
+                              'hyderabad','mumbai','pune','chennai','delhi','remote'];
+        for (var c3 = 0; c3 < fallbackCities.length; c3++) {
+            if (cardText.includes(fallbackCities[c3])) {
+                location = fallbackCities[c3].charAt(0).toUpperCase()
+                           + fallbackCities[c3].slice(1);
+                break;
+            }
+        }
     }
 
     if (title && title.toLowerCase() !== 'apply') {
         results.push({
             title: title, company: company,
-            location: location, index: idx
+            location: location, link: link, index: idx
         });
     }
 });
@@ -167,20 +217,23 @@ def _extract_jobs(driver: webdriver.Chrome) -> list[dict]:
         return []
 
     jobs = []
+    seen = set()
     for j in (raw or []):
         title = (j.get("title") or "").strip()
         company = (j.get("company") or "").strip()
         if not title:
             continue
-        uid = hashlib.md5(
-            f"{title}|{company}".encode()
-        ).hexdigest()[:12]
+        dedup_key = f"{title}|{company}".lower()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        uid = hashlib.md5(dedup_key.encode()).hexdigest()[:12]
         jobs.append({
             "title": title,
             "company": company,
             "location": j.get("location", ""),
             "description": "",
-            "link": "",
+            "link": j.get("link", ""),
             "job_id": f"wellfound_{uid}",
             "card_index": j.get("index", -1),
         })
@@ -210,24 +263,33 @@ def apply_to_job(driver: webdriver.Chrome, job: dict) -> bool:
 
 
 def _handle_post_apply(driver: webdriver.Chrome):
-    try:
+    for _ in range(3):
+        clicked = False
         for xpath in [
             "//button[contains(text(),'Submit')]",
             "//button[contains(text(),'Done')]",
+            "//button[contains(text(),'Continue')]",
+            "//button[contains(text(),'Send')]",
             "//button[contains(text(),'Close')]",
             "//button[contains(text(),'OK')]",
+            "//button[contains(text(),'Skip')]",
             "//button[@aria-label='Close']",
+            "//div[@role='dialog']//button[last()]",
+            "//*[contains(@class,'close') or contains(@class,'dismiss')]",
         ]:
             try:
                 btn = driver.find_element(By.XPATH, xpath)
                 if btn.is_displayed():
                     driver.execute_script("arguments[0].click();", btn)
                     time.sleep(1)
-                    return
+                    clicked = True
+                    break
             except NoSuchElementException:
                 continue
-    except Exception:
-        pass
+            except Exception:
+                continue
+        if not clicked:
+            break
 
 
 def _debug_dump_page(driver: webdriver.Chrome):

@@ -40,18 +40,28 @@ def login(driver: webdriver.Chrome, email: str = "", password: str = "") -> bool
 def search_jobs(
     driver: webdriver.Chrome, keyword: str = "", location: str = "",
 ) -> list[dict]:
-    """Browse Cutshort job listings."""
+    """Browse Cutshort job listings with fallback URL strategies."""
     slug = keyword or "backend-developer"
     slug = slug.lower().replace(" ", "-")
-    url = f"{BASE_URL}/jobs/{slug}-jobs"
+
+    category_url = f"{BASE_URL}/jobs/{slug}-jobs"
+    search_url = f"{BASE_URL}/jobs?search={slug.replace('-', '+')}"
+
     logger.info(f"Searching Cutshort: {slug}")
-    driver.get(url)
+    driver.get(category_url)
     time.sleep(6)
 
-    _scroll_page(driver, scrolls=5)
-
+    _scroll_page(driver, scrolls=8)
     jobs = _extract_jobs(driver)
-    logger.info(f"Found {len(jobs)} Cutshort jobs")
+
+    if not jobs:
+        logger.info(f"Category page empty, trying search URL for: {slug}")
+        driver.get(search_url)
+        time.sleep(6)
+        _scroll_page(driver, scrolls=8)
+        jobs = _extract_jobs(driver)
+
+    logger.info(f"Found {len(jobs)} Cutshort jobs for '{slug}'")
 
     if not jobs:
         _debug_dump_page(driver)
@@ -59,18 +69,22 @@ def search_jobs(
     return jobs
 
 
-def _scroll_page(driver: webdriver.Chrome, scrolls: int = 5):
+def _scroll_page(driver: webdriver.Chrome, scrolls: int = 8):
+    last_height = 0
     for _ in range(scrolls):
         driver.execute_script(
             "window.scrollTo(0, document.body.scrollHeight)"
         )
         time.sleep(2)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
 
 
 JS_EXTRACT_JOBS = """
 var results = [];
 
-// Cutshort: Find "Apply now" links/buttons and walk up to job cards
 var allEls = Array.from(document.querySelectorAll('button, a'));
 var applyBtns = allEls.filter(function(b) {
     var t = (b.textContent || '').trim().toLowerCase();
@@ -101,8 +115,8 @@ applyBtns.forEach(function(btn, idx) {
     var title = lines[0] || '';
     var company = '';
     var location = '';
+    var link = '';
 
-    // Look for "at CompanyName" pattern
     for (var j = 0; j < lines.length; j++) {
         if (lines[j].startsWith('at ')) {
             company = lines[j].substring(3).trim();
@@ -111,9 +125,19 @@ applyBtns.forEach(function(btn, idx) {
     }
     if (!company && lines.length > 1) company = lines[1];
 
+    // Extract link from any anchor in the card
+    var anchors = card.querySelectorAll('a[href]');
+    for (var a = 0; a < anchors.length; a++) {
+        var href = anchors[a].getAttribute('href') || '';
+        if (href.includes('/job/') || href.includes('/jobs/')) {
+            link = href.startsWith('http') ? href : 'https://cutshort.io' + href;
+            break;
+        }
+    }
+
     var cities = ['bangalore','bengaluru','noida','gurgaon','gurugram',
                   'hyderabad','mumbai','pune','chennai','delhi',
-                  'remote','india','work from home'];
+                  'remote','india','work from home','wfh'];
     for (var k = 0; k < lines.length; k++) {
         var lower = lines[k].toLowerCase();
         for (var c = 0; c < cities.length; c++) {
@@ -122,10 +146,21 @@ applyBtns.forEach(function(btn, idx) {
         if (location) break;
     }
 
+    // Fallback: scan card's full text for city mentions
+    if (!location) {
+        var cardText = (card.innerText || '').toLowerCase();
+        for (var c2 = 0; c2 < cities.length; c2++) {
+            if (cardText.includes(cities[c2])) {
+                location = cities[c2].charAt(0).toUpperCase() + cities[c2].slice(1);
+                break;
+            }
+        }
+    }
+
     if (title) {
         results.push({
             title: title, company: company,
-            location: location, index: idx
+            location: location, link: link, index: idx
         });
     }
 });
@@ -157,20 +192,23 @@ def _extract_jobs(driver: webdriver.Chrome) -> list[dict]:
         return []
 
     jobs = []
+    seen = set()
     for j in (raw or []):
         title = (j.get("title") or "").strip()
         company = (j.get("company") or "").strip()
         if not title:
             continue
-        uid = hashlib.md5(
-            f"{title}|{company}".encode()
-        ).hexdigest()[:12]
+        dedup_key = f"{title}|{company}".lower()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        uid = hashlib.md5(dedup_key.encode()).hexdigest()[:12]
         jobs.append({
             "title": title,
             "company": company,
             "location": j.get("location", ""),
             "description": "",
-            "link": "",
+            "link": j.get("link", ""),
             "job_id": f"cutshort_{uid}",
             "card_index": j.get("index", -1),
         })
@@ -200,24 +238,32 @@ def apply_to_job(driver: webdriver.Chrome, job: dict) -> bool:
 
 
 def _handle_post_apply(driver: webdriver.Chrome):
-    try:
+    for _ in range(3):
+        clicked = False
         for xpath in [
             "//button[contains(text(),'Submit')]",
             "//button[contains(text(),'Done')]",
+            "//button[contains(text(),'Continue')]",
             "//button[contains(text(),'Close')]",
             "//button[contains(text(),'OK')]",
+            "//button[contains(text(),'Skip')]",
             "//button[@aria-label='Close']",
+            "//div[@role='dialog']//button[last()]",
+            "//*[contains(@class,'close') or contains(@class,'dismiss')]",
         ]:
             try:
                 btn = driver.find_element(By.XPATH, xpath)
                 if btn.is_displayed():
                     driver.execute_script("arguments[0].click();", btn)
                     time.sleep(1)
-                    return
+                    clicked = True
+                    break
             except NoSuchElementException:
                 continue
-    except Exception:
-        pass
+            except Exception:
+                continue
+        if not clicked:
+            break
 
 
 def _debug_dump_page(driver: webdriver.Chrome):
