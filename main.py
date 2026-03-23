@@ -1,6 +1,7 @@
 import sys
 import logging
 import argparse
+from collections import Counter
 from datetime import datetime
 
 from selenium import webdriver
@@ -55,8 +56,16 @@ def _run_portal(
     keywords = portal_config["keywords"]
     locations = portal_config["locations"]
     limit = portal_config["daily_limit"]
+    # Cutshort/Wellfound search URLs ignore city; looping the same keyword 5×
+    # only re-fetches identical listings and burns time (seen_job_ids skips all).
+    search_once = portal_config.get("search_once_per_keyword", False)
+    location_iter = [""] if search_once else locations
+    allow_unknown_loc = bool(search_once)
 
     applied_count = 0
+    skip_already = 0
+    skip_seen = 0  # same job_id seen again in this run (another keyword/page)
+    skip_filter = Counter()  # bucket by first part of skip reason
     seen_job_ids: set[str] = set()
 
     for keyword in keywords:
@@ -64,7 +73,7 @@ def _run_portal(
             logger.info(f"{portal_name} daily limit ({limit}) reached")
             break
 
-        for location in locations:
+        for location in location_iter:
             if tracker.get_today_count(portal_name) >= limit:
                 break
 
@@ -80,10 +89,12 @@ def _run_portal(
 
                 job_id = job.get("job_id", "")
                 if job_id in seen_job_ids:
+                    skip_seen += 1
                     continue
                 seen_job_ids.add(job_id)
 
                 if tracker.is_already_applied(job_id):
+                    skip_already += 1
                     logger.debug(f"Already applied: {job_id}")
                     continue
 
@@ -98,9 +109,16 @@ def _run_portal(
                     search_location=location,
                     wfo_ok_cities=config.WFO_OK_CITIES,
                     relax_seniority=relax_seniority,
+                    allow_unknown_job_location=allow_unknown_loc,
                 )
 
                 if not ok:
+                    bucket = (
+                        (reason or "unknown").split(":", 1)[0].strip()
+                        if reason
+                        else "unknown"
+                    )
+                    skip_filter[bucket] += 1
                     logger.info(f"Skipped: {reason}")
                     continue
 
@@ -118,7 +136,19 @@ def _run_portal(
                     )
                     applied_count += 1
 
-    logger.info(f"{portal_name}: Applied to {applied_count} jobs")
+    filtered_total = sum(skip_filter.values())
+    logger.info(
+        f"{portal_name}: summary — applied: {applied_count}, "
+        f"already_in_tracker: {skip_already}, "
+        f"duplicate_in_session: {skip_seen}, "
+        f"filtered_out: {filtered_total}"
+    )
+    if skip_filter:
+        breakdown = ", ".join(
+            f"{name}={cnt}"
+            for name, cnt in skip_filter.most_common(12)
+        )
+        logger.info(f"{portal_name}: filter_breakdown — {breakdown}")
     return applied_count
 
 

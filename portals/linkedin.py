@@ -60,37 +60,57 @@ def search_jobs(driver: webdriver.Chrome, keyword: str, location: str = "") -> l
     encoded_keyword = quote_plus(keyword)
     encoded_location = quote_plus(location) if location else ""
 
-    url = (
+    base_url = (
         f"https://www.linkedin.com/jobs/search/"
         f"?keywords={encoded_keyword}"
         f"&location={encoded_location}"
         f"&f_AL=true"
         f"&f_E=4"
+        f"&f_TPR=r604800"
         f"&sortBy=DD"
     )
 
-    logger.info(f"Searching LinkedIn: {keyword} in {location or 'any location'}")
-    driver.get(url)
-    time.sleep(5)
+    all_jobs = []
+    seen_ids: set[str] = set()
 
-    _scroll_job_list(driver)
+    for page in range(3):
+        start = page * 25
+        url = f"{base_url}&start={start}" if page > 0 else base_url
 
-    jobs = []
-    job_cards = driver.find_elements(By.CSS_SELECTOR, ".job-card-container")
-    logger.info(f"Found {len(job_cards)} job cards")
+        logger.info(
+            f"Searching LinkedIn: {keyword} in {location or 'any'} "
+            f"(page {page + 1})"
+        )
+        driver.get(url)
+        time.sleep(5)
 
-    for card in job_cards:
-        try:
-            job = _extract_job_card(card)
-            if job:
-                jobs.append(job)
-        except Exception as e:
-            logger.debug(f"Failed to extract job card: {e}")
+        _scroll_job_list(driver)
 
-    return jobs
+        job_cards = driver.find_elements(By.CSS_SELECTOR, ".job-card-container")
+        if not job_cards:
+            break
+
+        page_jobs = 0
+        for card in job_cards:
+            try:
+                job = _extract_job_card(card)
+                if job and job["job_id"] not in seen_ids:
+                    seen_ids.add(job["job_id"])
+                    all_jobs.append(job)
+                    page_jobs += 1
+            except Exception as e:
+                logger.debug(f"Failed to extract job card: {e}")
+
+        logger.info(f"Found {page_jobs} new job cards on page {page + 1}")
+
+        if len(job_cards) < 10:
+            break
+
+    logger.info(f"Total: {len(all_jobs)} LinkedIn jobs for '{keyword}'")
+    return all_jobs
 
 
-def _scroll_job_list(driver: webdriver.Chrome, scrolls: int = 6):
+def _scroll_job_list(driver: webdriver.Chrome, scrolls: int = 8):
     scroll_selectors = [
         ".jobs-search-results-list",
         ".scaffold-layout__list > div",
@@ -246,9 +266,15 @@ def _find_easy_apply_button(driver: webdriver.Chrome):
 
 
 def _complete_application(driver: webdriver.Chrome, job: dict) -> bool:
-    max_steps = 10
+    max_steps = 15
+    stuck_count = 0
+    last_page_text = ""
+
     for step in range(max_steps):
         time.sleep(2)
+
+        if not _is_modal_visible(driver):
+            break
 
         _fill_form_fields(driver)
 
@@ -261,15 +287,16 @@ def _complete_application(driver: webdriver.Chrome, job: dict) -> bool:
         for label in ("Next", "Review", "Continue"):
             if _click_modal_button(driver, label):
                 logger.debug(f"Step {step}: clicked {label}")
+                stuck_count = 0
                 break
         else:
             unfilled = _count_unfilled_required(driver)
             if unfilled > 0:
                 logger.debug(
-                    f"Step {step}: {unfilled} required field(s) still empty, "
-                    "retrying with fallback fill"
+                    f"Step {step}: {unfilled} required field(s) still empty"
                 )
                 _fill_remaining_required(driver)
+                _fill_typeahead_inputs(driver)
                 time.sleep(1)
 
                 if _click_modal_button(driver, "Submit application"):
@@ -279,17 +306,37 @@ def _complete_application(driver: webdriver.Chrome, job: dict) -> bool:
                     return True
                 for label in ("Next", "Review", "Continue"):
                     if _click_modal_button(driver, label):
+                        stuck_count = 0
                         break
                 else:
-                    _log_form_state(driver, job.get("title", ""))
-                    _dismiss_modal(driver)
-                    return False
-            elif not _is_modal_visible(driver):
-                break
+                    stuck_count += 1
+            else:
+                current_text = _get_modal_text(driver)
+                if current_text == last_page_text:
+                    stuck_count += 1
+                else:
+                    stuck_count = 0
+                last_page_text = current_text
+
+            if stuck_count >= 2:
+                _log_form_state(driver, job.get("title", ""))
+                _dismiss_modal(driver)
+                return False
 
     logger.warning(f"Could not complete application for: {job['title']}")
     _dismiss_modal(driver)
     return False
+
+
+def _get_modal_text(driver: webdriver.Chrome) -> str:
+    try:
+        modal = driver.find_element(
+            By.CSS_SELECTOR,
+            ".jobs-easy-apply-modal, .artdeco-modal, [role='dialog']",
+        )
+        return (modal.text or "")[:200]
+    except Exception:
+        return ""
 
 
 def _is_modal_visible(driver: webdriver.Chrome) -> bool:
@@ -305,9 +352,12 @@ def _is_modal_visible(driver: webdriver.Chrome) -> bool:
 
 def _fill_form_fields(driver: webdriver.Chrome):
     _select_resume(driver)
+    _upload_resume_if_needed(driver)
     _fill_empty_inputs(driver)
+    _fill_typeahead_inputs(driver)
     _fill_textareas(driver)
     _fill_dropdowns(driver)
+    _fill_custom_dropdowns(driver)
     _fill_radio_buttons(driver)
     _fill_checkboxes(driver)
 
@@ -340,6 +390,104 @@ def _select_resume(driver: webdriver.Chrome):
                 return
     except Exception:
         pass
+
+
+def _upload_resume_if_needed(driver: webdriver.Chrome):
+    """If there's a file input for resume and no resume selected, upload it."""
+    import config
+
+    if not _os.path.exists(config.RESUME_PATH):
+        return
+
+    try:
+        modal = driver.find_element(
+            By.CSS_SELECTOR,
+            ".jobs-easy-apply-modal, .artdeco-modal, [role='dialog']",
+        )
+    except NoSuchElementException:
+        return
+
+    try:
+        file_inputs = modal.find_elements(
+            By.CSS_SELECTOR, "input[type='file']"
+        )
+        for fi in file_inputs:
+            accept = (fi.get_attribute("accept") or "").lower()
+            if "pdf" in accept or "doc" in accept or not accept:
+                fi.send_keys(config.RESUME_PATH)
+                logger.debug("Uploaded resume via file input")
+                time.sleep(2)
+                return
+    except Exception:
+        pass
+
+
+def _fill_typeahead_inputs(driver: webdriver.Chrome):
+    """Handle LinkedIn's typeahead/autocomplete city & skill inputs."""
+    import config
+
+    try:
+        modal = driver.find_element(
+            By.CSS_SELECTOR,
+            ".jobs-easy-apply-modal, .artdeco-modal, [role='dialog']",
+        )
+    except NoSuchElementException:
+        return
+
+    typeahead_inputs = modal.find_elements(
+        By.CSS_SELECTOR,
+        "input[role='combobox'], "
+        "input[aria-autocomplete='list'], "
+        "input[data-test-text-entity-list-filter-input]"
+    )
+    for inp in typeahead_inputs:
+        try:
+            if not inp.is_displayed():
+                continue
+            val = (inp.get_attribute("value") or "").strip()
+            if val:
+                continue
+
+            label_text = _get_input_label(inp.parent, inp).lower()
+
+            if any(k in label_text for k in ("city", "location", "where")):
+                inp.clear()
+                inp.send_keys(config.PREFERRED_CITY)
+                time.sleep(1.5)
+                _select_first_typeahead_option(driver)
+            elif "skill" in label_text:
+                inp.clear()
+                inp.send_keys("Python")
+                time.sleep(1.5)
+                _select_first_typeahead_option(driver)
+            elif any(k in label_text for k in ("company", "employer")):
+                pass
+            else:
+                inp.clear()
+                inp.send_keys(config.PREFERRED_CITY)
+                time.sleep(1.5)
+                _select_first_typeahead_option(driver)
+        except Exception:
+            continue
+
+
+def _select_first_typeahead_option(driver: webdriver.Chrome):
+    """Click the first dropdown option from a typeahead/autocomplete."""
+    for sel in [
+        "[role='listbox'] [role='option']",
+        ".basic-typeahead__selectable",
+        "[data-test-basic-typeahead-result]",
+        ".artdeco-typeahead__results-list li",
+    ]:
+        try:
+            options = driver.find_elements(By.CSS_SELECTOR, sel)
+            for opt in options:
+                if opt.is_displayed():
+                    driver.execute_script("arguments[0].click();", opt)
+                    time.sleep(0.5)
+                    return
+        except Exception:
+            continue
 
 
 def _select_preferred_email(driver: webdriver.Chrome):
@@ -388,13 +536,21 @@ def _match_field_value(label: str) -> str | None:
         return str(config.CURRENT_CTC_LAKHS)
 
     if any(k in label for k in ("notice period", "notice", "earliest start",
-                                "how soon", "joining")):
+                                "how soon", "joining", "lead time to join",
+                                "how early can you join")):
+        return "30"
+    if "day" in label and any(k in label for k in ("join", "start", "early")):
         return "30"
 
     if ("experience" in label or "years of work" in label or
             "how many year" in label or "professional experience" in label):
         return str(config.TOTAL_EXPERIENCE_YEARS)
 
+    if any(k in label for k in ("current location", "currently based",
+                                "current city", "based out of",
+                                "residing in", "where do you live",
+                                "home city", "where are you")):
+        return config.PREFERRED_CITY
     if any(k in label for k in ("city", "preferred location",
                                 "location preference")):
         return config.PREFERRED_CITY
@@ -437,6 +593,39 @@ def _match_field_value(label: str) -> str | None:
         return "No"
     if "headline" in label:
         return config.HEADLINE
+    if any(k in label for k in ("summary", "describe yourself")):
+        return config.HEADLINE
+
+    if any(k in label for k in ("first name", "given name")):
+        return "Anubhav"
+    if any(k in label for k in ("last name", "surname", "family name")):
+        return "Rathi"
+    if "full name" in label or "your name" in label or "enter name" in label:
+        return "Anubhav Rathi"
+
+    if any(k in label for k in ("how did you hear", "how you hear",
+                                "source of application", "where did you find",
+                                "how did you find")):
+        return "LinkedIn"
+    if any(k in label for k in ("reason for", "why are you",
+                                "primary reason", "seeking a new",
+                                "looking for a change")):
+        return "Career growth and better opportunities"
+    if any(k in label for k in ("current work mode", "work mode",
+                                "work arrangement")):
+        return "3"
+
+    if any(k in label for k in ("technologies", "tech stack",
+                                "primary technologies", "skills you")):
+        return "Python, Java, Django, Flask, PostgreSQL, Redis, AWS, Docker, Kubernetes"
+    if any(k in label for k in ("certification", "training program")):
+        return "AWS Solutions Architect, System Design"
+    if any(k in label for k in ("managed team", "team size",
+                                "leadership", "people management")):
+        return "Yes, managed a team of 5-8 engineers"
+    if any(k in label for k in ("small-scale", "large-scale",
+                                "project example", "worked on")):
+        return "Yes, built scalable microservices handling 10K+ RPS"
 
     if "year" in label:
         return str(config.TOTAL_EXPERIENCE_YEARS)
@@ -444,6 +633,18 @@ def _match_field_value(label: str) -> str | None:
         return str(config.TOTAL_EXPERIENCE_YEARS)
     if "proficien" in label:
         return str(config.TOTAL_EXPERIENCE_YEARS)
+    if any(k in label for k in ("rate yourself", "rating", "scale of")):
+        return "8"
+    if any(k in label for k in ("age", "date of birth", "dob")):
+        return "1998"
+    if any(k in label for k in ("address", "street")):
+        return config.PREFERRED_CITY
+    if any(k in label for k in ("zip", "pin code", "postal")):
+        return "122001"
+    if any(k in label for k in ("country",)):
+        return "India"
+    if any(k in label for k in ("state",)):
+        return "Haryana"
 
     return None
 
@@ -592,9 +793,17 @@ def _pick_yes_no(label: str) -> str | None:
 
 
 def _fill_dropdowns(driver: webdriver.Chrome):
-    """Smart dropdown filler: prefers Yes/No match, then first valid option."""
+    """Smart dropdown filler: handles country code, Yes/No, then first valid option."""
     try:
-        selects = driver.find_elements(By.CSS_SELECTOR, "select")
+        modal = driver.find_element(
+            By.CSS_SELECTOR,
+            ".jobs-easy-apply-modal, .artdeco-modal, [role='dialog']",
+        )
+    except NoSuchElementException:
+        return
+
+    try:
+        selects = modal.find_elements(By.CSS_SELECTOR, "select")
         for sel in selects:
             try:
                 if not sel.is_displayed():
@@ -605,6 +814,15 @@ def _fill_dropdowns(driver: webdriver.Chrome):
 
                 label_text = _get_input_label(driver, sel).lower()
                 options = sel.find_elements(By.TAG_NAME, "option")
+
+                if any(k in label_text for k in (
+                    "phone country", "country code", "dialing"
+                )):
+                    _select_country_code_india(options)
+                    continue
+
+                if "email" in label_text:
+                    pass
 
                 yn = _pick_yes_no(label_text)
                 if yn:
@@ -618,11 +836,36 @@ def _fill_dropdowns(driver: webdriver.Chrome):
                     else:
                         _select_first_valid_option(options)
                 else:
-                    _select_first_valid_option(options)
+                    matched = _match_field_value(label_text)
+                    if matched:
+                        for opt in options:
+                            if matched.lower() in opt.text.strip().lower():
+                                opt.click()
+                                logger.debug(
+                                    f"Dropdown '{label_text[:50]}' → "
+                                    f"'{opt.text.strip()}'"
+                                )
+                                break
+                        else:
+                            _select_first_valid_option(options)
+                    else:
+                        _select_first_valid_option(options)
             except Exception:
                 continue
     except Exception:
         pass
+
+
+def _select_country_code_india(options):
+    """Select India (+91) from a phone country code dropdown."""
+    for opt in options:
+        text = opt.text.strip().lower()
+        val = (opt.get_attribute("value") or "").strip()
+        if "india" in text or "+91" in text or val == "IN" or val == "in":
+            opt.click()
+            logger.debug("Selected India (+91) country code")
+            return
+    _select_first_valid_option(options)
 
 
 def _select_first_valid_option(options):
@@ -634,6 +877,62 @@ def _select_first_valid_option(options):
                                                   "choose"):
             opt.click()
             break
+
+
+def _fill_custom_dropdowns(driver: webdriver.Chrome):
+    """Handle LinkedIn's non-native dropdown components (artdeco-dropdown, etc.)."""
+    try:
+        modal = driver.find_element(
+            By.CSS_SELECTOR,
+            ".jobs-easy-apply-modal, .artdeco-modal, [role='dialog']",
+        )
+    except NoSuchElementException:
+        return
+
+    triggers = modal.find_elements(
+        By.CSS_SELECTOR,
+        "[data-test-text-selectable-option__input], "
+        "button[aria-haspopup='listbox'], "
+        "div[role='button'][aria-haspopup='listbox']"
+    )
+    for trigger in triggers:
+        try:
+            if not trigger.is_displayed():
+                continue
+
+            current_val = (trigger.text or "").strip()
+            if current_val and current_val.lower() not in (
+                "select an option", "select", "choose"
+            ):
+                continue
+
+            driver.execute_script("arguments[0].click();", trigger)
+            time.sleep(0.8)
+
+            for sel in [
+                "[role='option']",
+                "[data-test-text-selectable-option]",
+                ".artdeco-dropdown__content li",
+            ]:
+                options = driver.find_elements(By.CSS_SELECTOR, sel)
+                for opt in options:
+                    if opt.is_displayed():
+                        opt_text = opt.text.strip()
+                        if opt_text and opt_text.lower() not in (
+                            "select an option", "select"
+                        ):
+                            driver.execute_script(
+                                "arguments[0].click();", opt
+                            )
+                            logger.debug(
+                                f"Custom dropdown → '{opt_text[:40]}'"
+                            )
+                            break
+                else:
+                    continue
+                break
+        except Exception:
+            continue
 
 
 def _fill_radio_buttons(driver: webdriver.Chrome):
@@ -897,19 +1196,27 @@ def _dismiss_modal(driver: webdriver.Chrome):
     except TimeoutException:
         pass
 
-    try:
-        dismiss = driver.find_element(
-            By.CSS_SELECTOR, "button[aria-label='Dismiss']"
-        )
-        driver.execute_script("arguments[0].click();", dismiss)
-        time.sleep(1)
-    except NoSuchElementException:
+    for dismiss_sel in [
+        "button[aria-label='Dismiss']",
+        ".artdeco-modal__dismiss",
+        "button[data-test-modal-close-btn]",
+    ]:
+        try:
+            dismiss = driver.find_element(By.CSS_SELECTOR, dismiss_sel)
+            if dismiss.is_displayed():
+                driver.execute_script("arguments[0].click();", dismiss)
+                time.sleep(1)
+                break
+        except NoSuchElementException:
+            continue
+    else:
         return
 
     for xpath in [
         "//button[contains(text(),'Discard')]",
         "//button[@data-control-name='discard_application_confirm_btn']",
         "//button[contains(@data-test,'discard')]",
+        "//button[contains(text(),'Save')]",
     ]:
         try:
             btn = driver.find_element(By.XPATH, xpath)

@@ -51,14 +51,14 @@ def search_jobs(
     driver.get(category_url)
     time.sleep(6)
 
-    _scroll_page(driver, scrolls=8)
+    _scroll_page(driver, scrolls=14)
     jobs = _extract_jobs(driver)
 
     if not jobs:
         logger.info(f"Category page empty, trying search URL for: {slug}")
         driver.get(search_url)
         time.sleep(6)
-        _scroll_page(driver, scrolls=8)
+        _scroll_page(driver, scrolls=14)
         jobs = _extract_jobs(driver)
 
     logger.info(f"Found {len(jobs)} Cutshort jobs for '{slug}'")
@@ -69,7 +69,7 @@ def search_jobs(
     return jobs
 
 
-def _scroll_page(driver: webdriver.Chrome, scrolls: int = 8):
+def _scroll_page(driver: webdriver.Chrome, scrolls: int = 14):
     last_height = 0
     for _ in range(scrolls):
         driver.execute_script(
@@ -183,6 +183,38 @@ if (idx >= 0 && idx < applyBtns.length) {
 return {clicked: false, total: applyBtns.length};
 """
 
+# Prefer this over card_index: after each apply the DOM changes and indices shift.
+JS_CLICK_APPLY_BY_CARD = """
+var titleNeedle = (arguments[0] || '').toLowerCase().trim();
+var companyNeedle = (arguments[1] || '').toLowerCase().trim();
+if (!titleNeedle) return {clicked: false, reason: 'no_title'};
+
+var allEls = Array.from(document.querySelectorAll('button, a'));
+var applyBtns = allEls.filter(function(b) {
+    var t = (b.textContent || '').trim().toLowerCase();
+    return t === 'apply now' || t === 'apply'
+           || t === 'interested' || t === 'connect';
+});
+
+for (var i = 0; i < applyBtns.length; i++) {
+    var btn = applyBtns[i];
+    var card = btn;
+    for (var j = 0; j < 14; j++) {
+        card = card.parentElement;
+        if (!card) break;
+        var h = card.getBoundingClientRect().height;
+        if (h > 100) break;
+    }
+    if (!card) continue;
+    var cardText = (card.innerText || '').toLowerCase();
+    if (cardText.indexOf(titleNeedle) === -1) continue;
+    if (companyNeedle && cardText.indexOf(companyNeedle) === -1) continue;
+    btn.click();
+    return {clicked: true, matched: i};
+}
+return {clicked: false, total: applyBtns.length, reason: 'no_match'};
+"""
+
 
 def _extract_jobs(driver: webdriver.Chrome) -> list[dict]:
     try:
@@ -217,19 +249,60 @@ def _extract_jobs(driver: webdriver.Chrome) -> list[dict]:
 
 def apply_to_job(driver: webdriver.Chrome, job: dict) -> bool:
     title = job.get("title", "")
+    company = job.get("company", "") or ""
     card_index = job.get("card_index", -1)
 
     try:
-        result = driver.execute_script(JS_CLICK_APPLY, card_index)
+        # 1) Stable: find Apply on the card that contains this title (and company).
+        #    Using card_index breaks after earlier applies change the DOM order.
+        t_needle = (title or "").strip().lower()[:120]
+        c_needle = (company or "").strip().lower()[:100]
+        result = None
+        if t_needle:
+            result = driver.execute_script(
+                JS_CLICK_APPLY_BY_CARD, t_needle, c_needle
+            )
+        if not (result and result.get("clicked")) and c_needle:
+            result = driver.execute_script(JS_CLICK_APPLY_BY_CARD, t_needle, "")
+
+        # 2) Open job URL if listing page did not match (card off-screen, etc.)
+        opened_detail = False
+        if not (result and result.get("clicked")):
+            link = (job.get("link") or "").strip()
+            if link:
+                opened_detail = True
+                driver.get(link)
+                time.sleep(4)
+                result = driver.execute_script(
+                    JS_CLICK_APPLY_BY_CARD, t_needle, c_needle
+                )
+
+        # 3) Last resort: index only while still on listing (index is wrong on detail page)
+        if not (result and result.get("clicked")) and not opened_detail:
+            result = driver.execute_script(JS_CLICK_APPLY, card_index)
+
+        def _return_to_listing():
+            if not opened_detail:
+                return
+            try:
+                driver.back()
+                time.sleep(3)
+            except Exception:
+                pass
+
         if result and result.get("clicked"):
-            logger.info(f"Applied: {title} at {job.get('company', '')}")
+            logger.info(f"Applied: {title} at {company}")
             time.sleep(2)
             _handle_post_apply(driver)
+            _return_to_listing()
             return True
+
+        _return_to_listing()
 
         logger.warning(
             f"Could not click Apply for: {title} "
-            f"(buttons: {result.get('total', 0) if result else 0})"
+            f"(buttons: {result.get('total', 0) if result else 0}, "
+            f"reason: {result.get('reason', 'index') if result else 'none'})"
         )
         return False
     except Exception as e:

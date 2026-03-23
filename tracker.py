@@ -17,7 +17,7 @@ class ApplicationTracker:
     def _load(self):
         if os.path.exists(self.json_path):
             try:
-                with open(self.json_path, "r") as f:
+                with open(self.json_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                 for k, v in raw.items():
                     if isinstance(v, str):
@@ -36,8 +36,21 @@ class ApplicationTracker:
             self.applied = {}
 
     def _save(self):
-        with open(self.json_path, "w") as f:
-            json.dump(self.applied, f, indent=2, sort_keys=True)
+        """Atomic write so partial files aren't left if the process crashes."""
+        tmp_path = self.json_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.applied, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.json_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
 
     def is_already_applied(self, job_id: str) -> bool:
         return job_id in self.applied

@@ -93,8 +93,15 @@ def is_location_match(
     allowed_locations: list[str],
     search_location: str = "",
     wfo_ok_cities: set[str] | None = None,
+    allow_unknown_job_location: bool = False,
 ) -> bool:
-    if not location:
+    """
+    allow_unknown_job_location: for portals that don't pass a real search location
+    and often omit location on cards (e.g. Cutshort) — accept empty job location.
+    """
+    if not (location or "").strip():
+        if allow_unknown_job_location:
+            return True
         return bool(search_location)
 
     location_lower = location.lower()
@@ -191,11 +198,13 @@ def should_apply(
     search_location: str = "",
     wfo_ok_cities: set[str] | None = None,
     relax_seniority: bool = False,
+    allow_unknown_job_location: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """
     Returns (should_apply, skip_reason).
     relax_seniority=True trusts the portal's own seniority filter (e.g.
     LinkedIn f_E=4) and only rejects explicit junior/intern titles.
+    allow_unknown_job_location=True for portals with missing location text on cards.
     """
     if is_company_blacklisted(company, blacklisted_companies):
         return False, f"Blacklisted company: {company}"
@@ -213,7 +222,13 @@ def should_apply(
     if not title_is_backend and not desc_is_backend and not title_maybe_backend:
         return False, f"Not a backend role: {title}"
 
-    if not is_location_match(location, allowed_locations, search_location, wfo_ok_cities):
+    if not is_location_match(
+        location,
+        allowed_locations,
+        search_location,
+        wfo_ok_cities,
+        allow_unknown_job_location=allow_unknown_job_location,
+    ):
         return False, f"Location mismatch: {location}"
 
     if description and not matches_experience(description, min_experience):
